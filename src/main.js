@@ -8,10 +8,27 @@ function calculateSimpleRevenue(purchase, _product) {
   // purchase - это одна из записей в поле items из чека в data.purchase_records
   // _product - это продукт из коллекции data.products
 
+  // Validation of input data
+  if (!purchase || typeof purchase.sale_price !== "number" || purchase.sale_price < 0) {
+    throw new Error("Некорректное значение sale_price в позиции чека");
+  }
+  if (typeof purchase.quantity !== "number" || purchase.quantity <= 0 || !Number.isFinite(purchase.quantity)) {
+    throw new Error("Некорректное значение quantity в позиции чека");
+  }
+  if (typeof purchase.discount !== "number") {
+    throw new Error("Некорректное значение discount в позиции чека");
+  }
+  if (!_product || typeof _product.purchase_price !== "number" || _product.purchase_price < 0) {
+    throw new Error("Некорректные данные товара (отсутствует purchase_price)");
+  }
+
   const { discount, sale_price, quantity } = purchase;
 
+  // Ensure discount is between 0 and 100
+  const safeDiscount = Math.max(0, Math.min(discount, 100));
+
   // Discounted selling price per unit
-  const discountedPrice = sale_price * (1 - discount / 100);
+  const discountedPrice = sale_price * (1 - safeDiscount / 100);
 
   // Revenue from the unit
   const revenue = discountedPrice * quantity;
@@ -71,18 +88,38 @@ function analyzeSalesData(data, options = {}) {
     throw new Error("Некорректные входные данные - отсутствуют продавцы, товары или записи о покупках.");
   }
 
+  // Validate sellers data
+  if (!Array.isArray(data.sellers)) {
+    throw new Error("Поле sellers должно быть массивом.");
+  }
+  if (data.sellers.length === 0) {
+    // We can return an empty array or throw an error - here we return an empty array
+    return [];
+  }
+
+  // Validate purchase_records data
+  if (!Array.isArray(data.purchase_records)) {
+    throw new Error("Поле purchase_records должно быть массивом (даже пустым).");
+  }
+
   // Indexing goods by SKU for quick access
   const productsMap = new Map();
   if (Array.isArray(data.products)) {
-    data.products.forEach(product => productsMap.set(product.sku, product));
+    data.products.forEach(product => {
+      if (product && typeof product.sku === "string") {
+        productsMap.set(product.sku, product);
+      }
+    });
   }
-
-  // console.log("Product:", productsMap.get("SKU_090"));
 
   // Indexing sellers: key - seller_id, value - an object with accumulated
   // profit and initial data
   const sellersMap = new Map();
   data.sellers.forEach(seller => {
+    if (!seller || typeof seller.id !== "string") {
+      // Skipping sellers without valid id
+      return;
+    }
     sellersMap.set(seller.id, {
       seller_id: seller.id,
       name: `${seller.first_name} ${seller.last_name}`,
@@ -93,10 +130,18 @@ function analyzeSalesData(data, options = {}) {
     });
   });
 
+  if (sellersMap.size === 0) {
+    return [];
+  }
+
   // Calculation of profit for each check and each item
-  data.purchase_records.forEach(receipt => {
-    const sellerId = receipt.seller_id;
-    const seller = sellersMap.get(sellerId);
+  data.purchase_records.forEach((receipt, receiptIndex) => {
+    if (!receipt || typeof receipt.seller_id !== "string") {
+      // We can log: console.warn(`Чек #${receiptIndex} пропущен пропущен: нет seller_id.`);
+      return;
+    }
+
+    const seller = sellersMap.get(receipt.seller_id);
 
     if (!seller) {
       // If seller from receipt is missing in sellers collection - skip OR throw
@@ -104,23 +149,38 @@ function analyzeSalesData(data, options = {}) {
       return;
     }
 
-    receipt.items.forEach(item => {
-      const product = productsMap.get(item.sku);
+    if (!Array.isArray(receipt.items)) {
+      // If items is missing or not an array - skip the receipt
+      return;
+    }
 
-      if (!product) {
-        // If the product is not found, it is impossible to accurately calculate
-        // the profit; we skip the item
+    receipt.items.forEach((item, itemIndex) => {
+      if (!item ||
+        typeof item.sku !== "string" ||
+        typeof item.quantity !== "number" ||
+        item.quantity <= 0
+      ) {
+        // Skipping invalid item in receipt
         return;
       }
-      const { revenue, profit } = calculateRevenue(item, product);
+      const product = productsMap.get(item.sku);
 
-      seller.revenue += revenue;
-      seller.profit += profit;
-      seller.sales_count += item.quantity;
+      try {
+        const { revenue, profit } = calculateRevenue(item, product);
 
-      // Accumulate quantity sold for each product
-      const currentQuantity = seller.products_sold.get(item.sku) || 0;
-      seller.products_sold.set(item.sku, currentQuantity + item.quantity);
+        seller.revenue += revenue;
+        seller.profit += profit;
+        seller.sales_count += item.quantity;
+
+        // Accumulate quantity sold for each product
+        const currentQuantity = seller.products_sold.get(item.sku) || 0;
+        seller.products_sold.set(item.sku, currentQuantity + item.quantity);
+      } catch (error) {
+        // If a position causes a validation error, simply skip it.
+        // We can log error.message in debug
+        // console.warn(`Позиция #${itemIndex} в чеке #${receiptIndex} пропущена: ${error.message}`);
+        return;
+      }
     });
   });
 
@@ -133,6 +193,9 @@ function analyzeSalesData(data, options = {}) {
 
   // Calculate bonuses based on sorted order
   const total = sellerList.length;
+  if (total === 0) {
+    return [];
+  }
 
   const result = sellerList.map((seller, index) => {
     // Forming the top 10 products by quantity sold
