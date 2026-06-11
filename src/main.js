@@ -7,21 +7,6 @@
 function calculateSimpleRevenue(purchase, _product) {
   // purchase - это одна из записей в поле items из чека в data.purchase_records
   // _product - это продукт из коллекции data.products
-
-  // Validation of input data
-  if (!purchase || typeof purchase.sale_price !== "number" || purchase.sale_price < 0) {
-    throw new Error("Некорректное значение sale_price в позиции чека");
-  }
-  if (typeof purchase.quantity !== "number" || purchase.quantity <= 0 || !Number.isFinite(purchase.quantity)) {
-    throw new Error("Некорректное значение quantity в позиции чека");
-  }
-  if (typeof purchase.discount !== "number") {
-    throw new Error("Некорректное значение discount в позиции чека");
-  }
-  if (!_product || typeof _product.purchase_price !== "number" || _product.purchase_price < 0) {
-    throw new Error("Некорректные данные товара (отсутствует purchase_price)");
-  }
-
   const { discount, sale_price, quantity } = purchase;
 
   // Ensure discount is between 0 and 100
@@ -33,10 +18,7 @@ function calculateSimpleRevenue(purchase, _product) {
   // Revenue from the unit
   const revenue = discountedPrice * quantity;
 
-  // Profit from the unit: revenue minus purchase price
-  const profit = revenue - (_product.purchase_price * quantity);
-
-  return { revenue, profit };
+  return revenue;
 }
 
 /**
@@ -83,42 +65,27 @@ function analyzeSalesData(data, options = {}) {
     !Array.isArray(data.sellers) ||
     data.sellers.length === 0 ||
     !Array.isArray(data.purchase_records) ||
-    data.purchase_records.length === 0
+    data.purchase_records.length === 0 ||
+    !Array.isArray(data.products) ||
+    data.products.length === 0
   ) {
     throw new Error("Некорректные входные данные - отсутствуют продавцы, товары или записи о покупках.");
   }
 
-  // Validate sellers data
-  if (!Array.isArray(data.sellers)) {
-    throw new Error("Поле sellers должно быть массивом.");
-  }
-  if (data.sellers.length === 0) {
-    // We can return an empty array or throw an error - here we return an empty array
-    return [];
-  }
-
-  // Validate purchase_records data
-  if (!Array.isArray(data.purchase_records)) {
-    throw new Error("Поле purchase_records должно быть массивом (даже пустым).");
-  }
-
   // Indexing goods by SKU for quick access
   const productsMap = new Map();
-  if (Array.isArray(data.products)) {
-    data.products.forEach(product => {
-      if (product && typeof product.sku === "string") {
-        productsMap.set(product.sku, product);
-      }
-    });
-  }
+  data.products.forEach(product => {
+    if (product && typeof product.sku === "string") {
+      productsMap.set(product.sku, product);
+    }
+  });
 
   // Indexing sellers: key - seller_id, value - an object with accumulated
   // profit and initial data
   const sellersMap = new Map();
   data.sellers.forEach(seller => {
     if (!seller || typeof seller.id !== "string") {
-      // Skipping sellers without valid id
-      return;
+      throw new Error(`Продавец без валидного id: ${JSON.stringify(seller)}`);
     }
     sellersMap.set(seller.id, {
       seller_id: seller.id,
@@ -131,27 +98,19 @@ function analyzeSalesData(data, options = {}) {
   });
 
   if (sellersMap.size === 0) {
-    return [];
+    throw new Error("Нет валидных продавцов для анализа.");
   }
 
   // Calculation of profit for each check and each item
   data.purchase_records.forEach((receipt, receiptIndex) => {
     if (!receipt || typeof receipt.seller_id !== "string") {
-      // We can log: console.warn(`Чек #${receiptIndex} пропущен пропущен: нет seller_id.`);
-      return;
+      throw new Error(`Чек #${receiptIndex} пропущен: нет seller_id.`);
     }
 
     const seller = sellersMap.get(receipt.seller_id);
 
-    if (!seller) {
-      // If seller from receipt is missing in sellers collection - skip OR throw
-      // an error
-      return;
-    }
-
     if (!Array.isArray(receipt.items)) {
-      // If items is missing or not an array - skip the receipt
-      return;
+      throw new Error(`В чеке #${receiptIndex} поле items не является массивом.`);
     }
 
     receipt.items.forEach((item, itemIndex) => {
@@ -160,27 +119,26 @@ function analyzeSalesData(data, options = {}) {
         typeof item.quantity !== "number" ||
         item.quantity <= 0
       ) {
-        // Skipping invalid item in receipt
-        return;
+        throw new Error(`Позиция #${itemIndex} в чеке #${receiptIndex} имеет некорректные данные (sku или quantity).`);
       }
       const product = productsMap.get(item.sku);
+      if (!product) {
+        throw new Error(`В позиции #${itemIndex} чека #${receiptIndex} товар с SKU ${item.sku} не найден в данных о продуктах.`);
+      }
 
-      try {
-        const { revenue, profit } = calculateRevenue(item, product);
+      const revenue = calculateRevenue(item, product);
 
-        seller.revenue += revenue;
-        seller.profit += profit;
-        seller.sales_count += item.quantity;
+      const safeDiscount = Math.max(0, Math.min(item.discount, 100));
+      const discountedPrice = item.sale_price * (1 - safeDiscount / 100);
+      const profit = (discountedPrice * item.quantity) - (product.purchase_price * item.quantity);
+
+      seller.revenue += revenue;
+      seller.profit += profit;
+      seller.sales_count += item.quantity;
 
         // Accumulate quantity sold for each product
         const currentQuantity = seller.products_sold.get(item.sku) || 0;
         seller.products_sold.set(item.sku, currentQuantity + item.quantity);
-      } catch (error) {
-        // If a position causes a validation error, simply skip it.
-        // We can log error.message in debug
-        // console.warn(`Позиция #${itemIndex} в чеке #${receiptIndex} пропущена: ${error.message}`);
-        return;
-      }
     });
   });
 
@@ -194,7 +152,7 @@ function analyzeSalesData(data, options = {}) {
   // Calculate bonuses based on sorted order
   const total = sellerList.length;
   if (total === 0) {
-    return [];
+    throw new Error("После валидации не осталось продавцов для расчёта");
   }
 
   const result = sellerList.map((seller, index) => {
