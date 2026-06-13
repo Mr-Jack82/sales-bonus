@@ -7,7 +7,7 @@
 function calculateSimpleRevenue(purchase, _product) {
   // purchase - это одна из записей в поле items из чека в data.purchase_records
   // _product - это продукт из коллекции data.products
-  const { discount, sale_price, quantity } = purchase;
+  const { discount = 0, sale_price, quantity } = purchase;
 
   // Ensure discount is between 0 and 100
   const safeDiscount = Math.max(0, Math.min(discount, 100));
@@ -32,7 +32,7 @@ function calculateSimpleRevenue(purchase, _product) {
 function calculateBonusByProfit(index, total, seller) {
   // index - position in sorted list (0 = best)
   // total - total number of sellers
-  if (total === 1) return 0
+  if (total === 1) return 0;
 
   const { profit } = seller;
 
@@ -54,41 +54,56 @@ function calculateBonusByProfit(index, total, seller) {
  * @returns {{revenue, top_products, bonus, name, sales_count, profit, seller_id}[]}
  */
 
-function analyzeSalesData(data, options = {}) {
-  const {
-    calculateRevenue = calculateSimpleRevenue,
-    calculateBonus = calculateBonusByProfit
-  } = options;
-
+function analyzeSalesData(data, options) {
   // Validate input data
-  if (!data ||
-    !Array.isArray(data.sellers) ||
-    data.sellers.length === 0 ||
-    !Array.isArray(data.purchase_records) ||
-    data.purchase_records.length === 0 ||
-    !Array.isArray(data.products) ||
-    data.products.length === 0
-  ) {
-    throw new Error("Некорректные входные данные - отсутствуют продавцы, товары или записи о покупках.");
+  if (!data || typeof data !== "object") {
+    throw new Error("Отсутствует или невалиден объект data");
   }
 
-  // Indexing goods by SKU for quick access
-  const productsMap = new Map();
-  data.products.forEach(product => {
-    if (product && typeof product.sku === "string") {
-      productsMap.set(product.sku, product);
+  // Validate that required arrays are present and not empty
+  const requiredArrays = [
+    { key: "sellers", name: "sellers" },
+    { key: "products", name: "products" },
+    { key: "purchase_records", name: "purchase_records" },
+  ];
+
+  for (const { key, name } of requiredArrays) {
+    const value = data[key];
+    if (!Array.isArray(value)) {
+      throw new Error(`Поле ${name} должно быть массивом.`);
     }
-  });
+    if (value.length === 0) {
+      throw new Error(`Массив ${name} не должен быть пустым.`);
+    }
+  }
+
+  // Validate options
+  if (!options || typeof options !== "object") {
+    throw new Error("Опции не переданы или имеют неверный формат.");
+  }
+
+  const { calculateRevenue, calculateBonus } = options;
+
+  if (
+    typeof calculateRevenue !== "function" ||
+    typeof calculateBonus !== "function"
+  ) {
+    throw new Error(
+      "Параметры calculateRevenue и calculateBonus должны быть функциями."
+    );
+  }
 
   // Indexing sellers: key - seller_id, value - an object with accumulated
   // profit and initial data
-  const sellersMap = new Map();
+  const sellerIndex = new Map();
+  const productIndex = new Map();
+
   data.sellers.forEach(seller => {
     if (!seller || typeof seller.id !== "string") {
-      throw new Error(`Продавец без валидного id: ${JSON.stringify(seller)}`);
+      throw new Error("Каждый продавец должен иметь валидный строковый id.");
     }
-    sellersMap.set(seller.id, {
-      seller_id: seller.id,
+    sellerIndex.set(seller.id, {
+      id: seller.id,
       name: `${seller.first_name} ${seller.last_name}`,
       revenue: 0,
       profit: 0,
@@ -97,88 +112,106 @@ function analyzeSalesData(data, options = {}) {
     });
   });
 
-  if (sellersMap.size === 0) {
-    throw new Error("Нет валидных продавцов для анализа.");
-  }
+  data.products.forEach(product => {
+    if (
+      (!product && typeof product.sku !== "string") ||
+      typeof product.purchase_price !== "number"
+    ) {
+      throw new Error(
+        "Каждый товар должен иметь строковый SKU и числовой purchase_price."
+      );
+    }
+    productIndex.set(product.sku, product);
+  });
 
-  // Calculation of profit for each check and each item
-  data.purchase_records.forEach((receipt, receiptIndex) => {
-    if (!receipt || typeof receipt.seller_id !== "string") {
-      throw new Error(`Чек #${receiptIndex} пропущен: нет seller_id.`);
+  // console.log("sellerStats:", sellerStats);
+
+  // Indexing goods by SKU for quick access
+  data.purchase_records.forEach((record, recIdx) => {
+    if (!record && typeof record.seller_id !== "string") {
+      throw new Error(`Чек #${recIdx} не содержит валидного seller_id.`);
+    }
+    const seller = sellerIndex.get(record.seller_id);
+    if (!seller) {
+      throw new Error(
+        `В чеке #${recIdx} указан продавец с id="${record.seller_id}", которого нет в данных о продавцах.`
+      );
     }
 
-    const seller = sellersMap.get(receipt.seller_id);
+    // Counting the number of sales (checks) for the seller
+    seller.sales_count += 1;
 
-    if (!Array.isArray(receipt.items)) {
-      throw new Error(`В чеке #${receiptIndex} поле items не является массивом.`);
-    }
+    if (Array.isArray(record.items)) {
+      record.items.forEach((item, itemIdx) => {
+        if (
+          !item ||
+          typeof item.sku !== "string" ||
+          typeof item.quantity !== "number" ||
+          item.quantity <= 0
+        ) {
+          throw new Error(
+            `Позиция #${itemIdx} в чеке #${recIdx} имеет некорректные данные`
+          );
+        }
+        const product = productIndex.get(item.sku);
+        if (!product) {
+          throw new Error(
+            `Товар с SKU="#${item.sku}" в позиции #${itemIdx}, чек #${recIdx} отсутствует в данных о продуктах.`
+          );
+        }
 
-    receipt.items.forEach((item, itemIndex) => {
-      if (!item ||
-        typeof item.sku !== "string" ||
-        typeof item.quantity !== "number" ||
-        item.quantity <= 0
-      ) {
-        throw new Error(`Позиция #${itemIndex} в чеке #${receiptIndex} имеет некорректные данные (sku или quantity).`);
-      }
-      const product = productsMap.get(item.sku);
-      if (!product) {
-        throw new Error(`В позиции #${itemIndex} чека #${receiptIndex} товар с SKU ${item.sku} не найден в данных о продуктах.`);
-      }
+        // Revenue calculation for each item in the check
+        const revenue = calculateRevenue(item, product);
 
-      const revenue = calculateRevenue(item, product);
+        // Cost price and profit
+        const cost = product.purchase_price * item.quantity;
+        const profit = revenue - cost;
 
-      const safeDiscount = Math.max(0, Math.min(item.discount, 100));
-      const discountedPrice = item.sale_price * (1 - safeDiscount / 100);
-      const profit = (discountedPrice * item.quantity) - (product.purchase_price * item.quantity);
-
-      seller.revenue += revenue;
-      seller.profit += profit;
-      seller.sales_count += item.quantity;
+        seller.revenue += revenue;
+        seller.profit += profit;
 
         // Accumulate quantity sold for each product
         const currentQuantity = seller.products_sold.get(item.sku) || 0;
         seller.products_sold.set(item.sku, currentQuantity + item.quantity);
-    });
+      });
+    }
   });
 
   // Convert to an array for sorting
-  const sellerList = Array.from(sellersMap.values());
+  const resultList = Array.from(sellerIndex.values());
 
   // Sort sellers by profit in descending order
-  sellerList.sort((a, b) => b.profit - a.profit);
+  resultList.sort((a, b) => b.profit - a.profit);
 
+  const total = resultList.length;
 
   // Calculate bonuses based on sorted order
-  const total = sellerList.length;
-  if (total === 0) {
-    throw new Error("После валидации не осталось продавцов для расчёта");
-  }
-
-  const result = sellerList.map((seller, index) => {
-    // Forming the top 10 products by quantity sold
-    const topProducts = Array.from(seller.products_sold.entries())
-      .map(([sku, quantity]) => ({ sku, quantity }))
-      .sort((a, b) => b.quantity - a.quantity) // sort by quantity sold
-      .slice(0, 10); // take top 10
-
-    let bonus = calculateBonus(index, total, seller);
-
-    // Bonus cannot be negative, if the calculation logic allows for that
-    if (bonus < 0) {
-      bonus = 0;
-    }
-
-    return {
-      seller_id: seller.seller_id,
-      name: seller.name,
-      revenue: Math.round(seller.revenue * 100) / 100, // rounding to 2 decimal places
-      profit: Math.round(seller.profit * 100) / 100, // rounding to 2 decimal places
-      sales_count: seller.sales_count,
-      top_products: topProducts,
-      bonus: Math.round(bonus * 100) / 100 // rounding to 2 decimal places
-    };
+  resultList.forEach((seller, index) => {
+    const bonusRaw = calculateBonus(index, total, { profit: seller.profit });
+    seller.bonus = bonusRaw < 0 ? 0 : bonusRaw;
   });
 
-  return result;
+  // Forming the final result with top 10 products for each seller
+  return resultList.map(seller => {
+    // Top-10 goods: first by quantity (descending), then by SKU (ascending)
+    const topProducts = Array.from(seller.products_sold.entries())
+      .map(([sku, quantity]) => ({ sku, quantity }))
+      .sort((a, b) => {
+        if (b.quantity !== a.quantity) return b.quantity - a.quantity;
+        return a.sku.localeCompare(b.sku); // sort by SKU if quantities are equal
+      })
+      .slice(0, 10);
+
+    const round2 = x => Math.round(x * 100) / 100;
+
+    return {
+      seller_id: seller.id,
+      name: `${seller.first_name} ${seller.last_name}`,
+      revenue: round2(seller.revenue),
+      profit: round2(seller.profit),
+      sales_count: seller.sales_count,
+      top_products: topProducts,
+      bonus: round2(seller.bonus),
+    };
+  });
 }
